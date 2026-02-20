@@ -1,0 +1,170 @@
+#!/bin/bash
+
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Функция для проверки прав root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Ошибка: Скрипт должен запускаться с правами root${NC}"
+        echo "Пожалуйста, запустите с sudo: sudo $0 $*"
+        exit 1
+    fi
+}
+
+# Функция для валидации IP октета
+validate_octet() {
+    local octet=$1
+    local name=$2
+    
+    # Проверка, что параметр передан
+    if [[ -z "$octet" ]]; then
+        return 1
+    fi
+    
+    # Проверка, что это число от 0 до 255
+    if [[ ! "$octet" =~ ^[0-9]{1,3}$ ]] || [[ "$octet" -lt 0 ]] || [[ "$octet" -gt 255 ]]; then
+        echo -e "${RED}Ошибка: $name должен быть числом от 0 до 255${NC}" >&2
+        exit 1
+    fi
+    
+    # Удаляем ведущие нули для корректного сравнения
+    echo "$((10#$octet))"
+}
+
+# Функция для валидации интерфейса
+validate_interface() {
+    local interface=$1
+    
+    if [[ -z "$interface" ]]; then
+        echo -e "${RED}Ошибка: INTERFACE должен быть указан${NC}" >&2
+        exit 1
+    fi
+    
+    # Проверка существования интерфейса
+    if ! ip link show "$interface" &>/dev/null; then
+        echo -e "${RED}Ошибка: Интерфейс $interface не существует${NC}" >&2
+        exit 1
+    fi
+}
+
+# Функция для проверки наличия arping
+check_arping() {
+    if ! command -v arping &>/dev/null; then
+        echo -e "${RED}Ошибка: arping не установлен${NC}"
+        echo "Установите: sudo apt install iputils-arping (для Debian/Ubuntu)"
+        echo "или: sudo yum install arping (для CentOS/RHEL)"
+        exit 1
+    fi
+}
+
+# Функция сканирования одного IP
+scan_ip() {
+    local ip=$1
+    local interface=$2
+    
+    echo -e "${YELLOW}[*] Сканирование IP: ${ip}${NC}"
+    arping -c 3 -i "$interface" "$ip" 2>/dev/null | while read line; do
+        if [[ "$line" =~ .*reply.*from.* ]]; then
+            echo -e "${GREEN}  ✓ Найден хост: $line${NC}"
+        fi
+    done
+}
+
+# Функция сканирования подсети
+scan_subnet() {
+    local prefix=$1
+    local subnet=$2
+    local interface=$3
+    local start_host=${4:-1}
+    local end_host=${5:-255}
+    
+    echo -e "${GREEN}Сканирование подсети ${prefix}.${subnet}.0/24${NC}"
+    echo "=================================="
+    
+    for host in $(seq "$start_host" "$end_host"); do
+        ip="${prefix}.${subnet}.${host}"
+        scan_ip "$ip" "$interface"
+    done
+}
+
+# Основная функция
+main() {
+    # Проверка прав root
+    check_root "$@"
+    
+    # Проверка наличия arping
+    check_arping
+    
+    # Получение аргументов
+    PREFIX="$1"
+    INTERFACE="$2"
+    SUBNET="$3"
+    HOST="$4"
+    
+    # Проверка обязательных аргументов
+    if [[ -z "$PREFIX" ]]; then
+        echo -e "${RED}Ошибка: PREFIX должен быть указан${NC}"
+        echo "Использование: $0 <PREFIX> <INTERFACE> [SUBNET] [HOST]"
+        echo "Примеры:"
+        echo "  $0 192.168.1 eth0           # Сканировать всю сеть 192.168.1.0/24"
+        echo "  $0 10.0  eth0 5              # Сканировать подсеть 10.0.5.0/24"
+        echo "  $0 172.16 eth0 1 100         # Сканировать только IP 172.16.1.100"
+        exit 1
+    fi
+    
+    # Валидация интерфейса
+    validate_interface "$INTERFACE"
+    
+    # Валидация PREFIX (должен содержать 1 или 2 октета)
+    if [[ ! "$PREFIX" =~ ^[0-9]{1,3}(\.[0-9]{1,3})?$ ]]; then
+        echo -e "${RED}Ошибка: PREFIX должен содержать 1 или 2 октета (например: 192 или 192.168)${NC}"
+        exit 1
+    fi
+    
+    # Разбиваем PREFIX на октеты
+    IFS='.' read -ra PREFIX_OCTETS <<< "$PREFIX"
+    
+    # Проверяем каждый октет PREFIX
+    prefix_valid=""
+    for octet in "${PREFIX_OCTETS[@]}"; do
+        valid_octet=$(validate_octet "$octet" "Октет PREFIX")
+        prefix_valid="${prefix_valid}${prefix_valid:+.}${valid_octet}"
+    done
+    
+    # Определяем режим сканирования
+    if [[ -n "$SUBNET" && -n "$HOST" ]]; then
+        # Режим 3: сканирование одного IP
+        valid_subnet=$(validate_octet "$SUBNET" "SUBNET")
+        valid_host=$(validate_octet "$HOST" "HOST")
+        
+        echo -e "${GREEN}Режим: Сканирование одного IP${NC}"
+        ip="${prefix_valid}.${valid_subnet}.${valid_host}"
+        scan_ip "$ip" "$INTERFACE"
+        
+    elif [[ -n "$SUBNET" ]]; then
+        # Режим 2: сканирование одной подсети
+        valid_subnet=$(validate_octet "$SUBNET" "SUBNET")
+        
+        echo -e "${GREEN}Режим: Сканирование подсети ${prefix_valid}.${valid_subnet}.0/24${NC}"
+        scan_subnet "$prefix_valid" "$valid_subnet" "$INTERFACE"
+        
+    else
+        # Режим 1: сканирование всех подсетей
+        echo -e "${GREEN}Режим: Сканирование всех подсетей ${prefix_valid}.0.0/16${NC}"
+        echo "Это может занять некоторое время..."
+        echo "=================================="
+        
+        for subnet in {1..255}; do
+            scan_subnet "$prefix_valid" "$subnet" "$INTERFACE"
+        done
+    fi
+    
+    echo -e "\n${GREEN}Сканирование завершено!${NC}"
+}
+
+# Запуск основной функции с передачей всех аргументов
+main "$@"
