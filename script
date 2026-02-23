@@ -1,4 +1,6 @@
-#!/bin/bash
+   #!/bin/bash
+
+NC='\033[0m' # No Color
 
 # Функция для проверки прав root
 check_root() {
@@ -15,7 +17,7 @@ validate_octet() {
     local name=$2
     
     # Проверка, что параметр передан
-    if [[ -z "$octet" ]]; then
+    if [[ -z "$octet" ]];; then
         return 1
     fi
     
@@ -27,6 +29,33 @@ validate_octet() {
     
     # Удаляем ведущие нули для корректного сравнения
     echo "$((10#$octet))"
+}
+
+# Функция для валидации PREFIX (должен содержать 2 октета)
+validate_prefix() {
+    local prefix=$1
+    
+    if [[ -z "$prefix" ]]; then
+        echo -e "Ошибка: PREFIX должен быть указан" >&2
+        exit 1
+    fi
+    
+    # Проверка формата: два октета, разделенные точкой
+    if [[ ! "$prefix" =~ ^[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        echo -e "Ошибка: PREFIX должен содержать 2 октета в формате xxx.xxx (например: 192.168)" >&2
+        exit 1
+    fi
+    
+    # Разбиваем на октеты и проверяем каждый
+    IFS='.' read -ra OCTETS <<< "$prefix"
+    local valid_prefix=""
+    
+    for i in {0..1}; do
+        valid_octet=$(validate_octet "${OCTETS[$i]}" "Октет $((i+1)) PREFIX")
+        valid_prefix="${valid_prefix}${valid_prefix:+.}${valid_octet}"
+    done
+    
+    echo "$valid_prefix"
 }
 
 # Функция для валидации интерфейса
@@ -63,20 +92,20 @@ scan_ip() {
     echo -e "[*] Сканирование IP: ${ip}"
     arping -c 3 -i "$interface" "$ip" 2>/dev/null | while read line; do
         if [[ "$line" =~ .*reply.*from.* ]]; then
-            echo -e "  ✓ Найден хост: $line"
+            echo -e " ✓ Найден хост: $line"
         fi
     done
 }
 
-# Функция сканирования подсети
+# Функция сканирования подсети (одна /24 сеть)
 scan_subnet() {
-    local prefix=$1
-    local subnet=$2
+    local prefix=$1      # первые два октета (192.168)
+    local subnet=$2       # третий октет (1)
     local interface=$3
     local start_host=${4:-1}
     local end_host=${5:-255}
     
-    echo -e "Сканирование подсети ${prefix}.${subnet}.0/24"
+    echo -e "${GREEN}Сканирование подсети ${prefix}.${subnet}.0/24"
     echo "=================================="
     
     for host in $(seq "$start_host" "$end_host"); do
@@ -94,40 +123,27 @@ main() {
     check_arping
     
     # Получение аргументов
-    PREFIX="$1"
+    PREFIX="$1"      # Должен быть в формате xxx.xxx (первые два октета)
     INTERFACE="$2"
-    SUBNET="$3"
-    HOST="$4"
+    SUBNET="$3"       # Третий октет (опционально)
+    HOST="$4"         # Четвертый октет (опционально)
     
     # Проверка обязательных аргументов
     if [[ -z "$PREFIX" ]]; then
         echo -e "Ошибка: PREFIX должен быть указан"
         echo "Использование: $0 <PREFIX> <INTERFACE> [SUBNET] [HOST]"
         echo "Примеры:"
-        echo "  $0 192.168.1 eth0           # Сканировать всю сеть 192.168.1.0/24"
-        echo "  $0 10.0  eth0 5              # Сканировать подсеть 10.0.5.0/24"
-        echo "  $0 172.16 eth0 1 100         # Сканировать только IP 172.16.1.100"
+        echo "  $0 192.168 eth0              # Сканировать всю сеть 192.168.0.0/16 (все подсети)"
+        echo "  $0 192.168 eth0 1             # Сканировать подсеть 192.168.1.0/24"
+        echo "  $0 192.168 eth0 1 100         # Сканировать только IP 192.168.1.100"
         exit 1
     fi
     
     # Валидация интерфейса
     validate_interface "$INTERFACE"
     
-    # Валидация PREFIX (должен содержать 1 или 2 октета)
-    if [[ ! "$PREFIX" =~ ^[0-9]{1,3}(\.[0-9]{1,3})?$ ]]; then
-        echo -e "Ошибка: PREFIX должен содержать 1 или 2 октета (например: 192 или 192.168)"
-        exit 1
-    fi
-    
-    # Разбиваем PREFIX на октеты
-    IFS='.' read -ra PREFIX_OCTETS <<< "$PREFIX"
-    
-    # Проверяем каждый октет PREFIX
-    prefix_valid=""
-    for octet in "${PREFIX_OCTETS[@]}"; do
-        valid_octet=$(validate_octet "$octet" "Октет PREFIX")
-        prefix_valid="${prefix_valid}${prefix_valid:+.}${valid_octet}"
-    done
+    # Валидация PREFIX (должен содержать 2 октета)
+    valid_prefix=$(validate_prefix "$PREFIX")
     
     # Определяем режим сканирования
     if [[ -n "$SUBNET" && -n "$HOST" ]]; then
@@ -135,29 +151,32 @@ main() {
         valid_subnet=$(validate_octet "$SUBNET" "SUBNET")
         valid_host=$(validate_octet "$HOST" "HOST")
         
-        echo -e "Режим: Сканирование одного IP"
-        ip="${prefix_valid}.${valid_subnet}.${valid_host}"
+        echo -e "${GREEN}Режим: Сканирование одного IP"
+        ip="${valid_prefix}.${valid_subnet}.${valid_host}"
         scan_ip "$ip" "$INTERFACE"
         
     elif [[ -n "$SUBNET" ]]; then
-        # Режим 2: сканирование одной подсети
+        # Режим 2: сканирование одной подсети (/24)
         valid_subnet=$(validate_octet "$SUBNET" "SUBNET")
         
-        echo -e "Режим: Сканирование подсети ${prefix_valid}.${valid_subnet}.0/24"
-        scan_subnet "$prefix_valid" "$valid_subnet" "$INTERFACE"
+        echo -e "${GREEN}Режим: Сканирование одной подсети"
+        scan_subnet "$valid_prefix" "$valid_subnet" "$INTERFACE"
         
     else
-        # Режим 1: сканирование всех подсетей
-        echo -e "Режим: Сканирование всех подсетей ${prefix_valid}.0.0/16"
-        echo "Это может занять некоторое время..."
+        # Режим 1: сканирование всех подсетей (все /24 в /16 сети)
+        echo -e "${GREEN}Режим: Сканирование всех подсетей ${valid_prefix}.0.0/16"
+        echo "Это может занять значительное время (65,535 адресов)..."
         echo "=================================="
         
         for subnet in {1..255}; do
-            scan_subnet "$prefix_valid" "$subnet" "$INTERFACE"
+            scan_subnet "$valid_prefix" "$subnet" "$INTERFACE"
+            
+            # Небольшая задержка между подсетями, чтобы не перегружать сеть
+            sleep 1
         done
     fi
     
-    echo -e "\nСканирование завершено!"
+    echo -e "\n${GREEN}Сканирование завершено!"
 }
 
 # Запуск основной функции с передачей всех аргументов
